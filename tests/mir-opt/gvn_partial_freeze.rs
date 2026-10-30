@@ -1,4 +1,5 @@
 //@ test-mir-pass: GVN
+// EMIT_MIR_FOR_EACH_PANIC_STRATEGY
 // EMIT_MIR gvn_partial_freeze.cmp_freeze.GVN.diff
 // EMIT_MIR gvn_partial_freeze.cmp_non_freeze.GVN.diff
 
