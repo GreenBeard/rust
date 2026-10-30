@@ -1,0 +1,71 @@
+- // MIR for `cmp_non_freeze` before GVN
++ // MIR for `cmp_non_freeze` after GVN
+  
+  fn cmp_non_freeze(_1: &PartialFreeze, _2: fn()) -> bool {
+      debug partial_freeze => _1;
+      debug f => _2;
+      let mut _0: bool;
+      let _3: u32;
+      let mut _4: *mut u32;
+      let mut _5: &std::cell::UnsafeCell<u32>;
+      let _6: ();
+      let mut _7: fn();
+      let mut _9: *mut u32;
+      let mut _10: &std::cell::UnsafeCell<u32>;
+      let mut _11: u32;
+      let mut _12: u32;
+      scope 1 {
+          debug old => _3;
+          let _8: u32;
+          scope 2 {
+              debug new => _8;
+          }
+      }
+  
+      bb0: {
+          StorageLive(_3);
+          StorageLive(_4);
+          StorageLive(_5);
+          _5 = &((*_1).0: std::cell::UnsafeCell<u32>);
+          _4 = UnsafeCell::<u32>::get(move _5) -> [return: bb1, unwind unreachable];
+      }
+  
+      bb1: {
+          StorageDead(_5);
+          _3 = copy (*_4);
+          StorageDead(_4);
+          StorageLive(_6);
+          StorageLive(_7);
+          _7 = copy _2;
+-         _6 = move _7() -> [return: bb2, unwind unreachable];
++         _6 = copy _2() -> [return: bb2, unwind unreachable];
+      }
+  
+      bb2: {
+          StorageDead(_7);
+          StorageDead(_6);
+          StorageLive(_8);
+          StorageLive(_9);
+          StorageLive(_10);
+          _10 = &((*_1).0: std::cell::UnsafeCell<u32>);
+          _9 = UnsafeCell::<u32>::get(move _10) -> [return: bb3, unwind unreachable];
+      }
+  
+      bb3: {
+          StorageDead(_10);
+          _8 = copy (*_9);
+          StorageDead(_9);
+          StorageLive(_11);
+          _11 = copy _3;
+          StorageLive(_12);
+          _12 = copy _8;
+-         _0 = Eq(move _11, move _12);
++         _0 = Eq(copy _3, copy _8);
+          StorageDead(_12);
+          StorageDead(_11);
+          StorageDead(_8);
+          StorageDead(_3);
+          return;
+      }
+  }
+  

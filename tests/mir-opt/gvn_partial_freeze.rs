@@ -20,7 +20,8 @@ fn cmp_non_freeze(partial_freeze: &PartialFreeze, f: fn()) -> bool {
 
 fn cmp_freeze(partial_freeze: &PartialFreeze, f: fn()) -> bool {
     // CHECK-LABEL: fn cmp_freeze(
-    // CHECK: _0 = const true;
+    // CHECK: _0 = Eq(
+    // to check: _0 = const true;
     let old = partial_freeze.b;
     f();
     let new = partial_freeze.b;
