@@ -1,4 +1,6 @@
 //@ test-mir-pass: GVN
+// EMIT_MIR gvn_partial_freeze.cmp_freeze.GVN.diff
+// EMIT_MIR gvn_partial_freeze.cmp_non_freeze.GVN.diff
 
 use std::cell::UnsafeCell;
 
@@ -7,16 +9,18 @@ struct PartialFreeze {
     b: u32,
 }
 
-// EMIT_MIR gvn_partial_freeze.cmp_non_freeze.GVN.diff
 fn cmp_non_freeze(partial_freeze: &PartialFreeze, f: fn()) -> bool {
+    // CHECK-LABEL: fn cmp_non_freeze(
+    // CHECK: _0 = Eq(
     let old = unsafe { *partial_freeze.a.get() };
     f();
     let new = unsafe { *partial_freeze.a.get() };
     old == new
 }
 
-// EMIT_MIR gvn_partial_freeze.cmp_freeze.GVN.diff
 fn cmp_freeze(partial_freeze: &PartialFreeze, f: fn()) -> bool {
+    // CHECK-LABEL: fn cmp_freeze(
+    // CHECK: _0 = const true;
     let old = partial_freeze.b;
     f();
     let new = partial_freeze.b;
