@@ -266,6 +266,11 @@ enum Value<'a, 'tcx> {
         provenance: VnOpaque,
     },
 
+    // coffin: this is where I want to improve things I think.
+    // 1. I need to come up with a list of replacements that I want and don't want
+    // 2. I need to understand how this is used everywhere
+    // 3. I need to either replace it or add another variant
+    //
     // Extractions.
     /// This is the *value* obtained by projecting another value.
     Projection(VnIndex, ProjectionElem<VnIndex, ()>),
@@ -821,13 +826,54 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
     #[instrument(level = "trace", skip(self), ret)]
     fn project(
         &mut self,
+        // coffin: type of the parent in the Place's chain
         place_ty: PlaceTy<'tcx>,
+        // coffin: value of the parent in the Place's chain
         value: VnIndex,
+        // coffin: an entry within a projection (could be anywhere in the place's projection list)
+        // the VnIndex is the value of the local
         proj: ProjectionElem<VnIndex, Ty<'tcx>>,
     ) -> Option<(PlaceTy<'tcx>, VnIndex)> {
         let projection_ty = place_ty.projection_ty(self.tcx, proj);
         let proj = match proj {
             ProjectionElem::Deref => {
+                // coffin: Hmm, if I'm understanding this correctly the issue is that the GVN is looking at each
+                // component individually. Since I don't think that this code is doing analysis to see that these
+                // can be merged:
+                //
+                // ```
+                // struct Foo<'a> {
+                //     ref: &'a u32,
+                // }
+                //
+                // let foo: &mut Foo = todo!();
+                // let a = foo.ref;
+                // ... (no modification of `foo.ref` or escaping of `foo` via escape analysis and foo is not UnsafePinned so we have exclusive access).
+                // let b = foo.ref;
+                // ```
+                //
+                // but more importantly:
+                // it seems that it also is treating:
+                //
+                // ```
+                // struct Bar {
+                //     x: u32,
+                //     y: UnsafeCell<u32>,
+                // }
+                //
+                // let foo: &Bar = todo!();
+                // let a = &foo.y;
+                // ...
+                // let b = &foo.y;
+                // ```
+                //
+                // as non-mergeable since it is looking at &(*foo).y and sees that *foo is not Freeze...
+                //
+                // I want to say that one can optimize consecutive Field projections if the last is a non-Freeze element but that doesn't seem true based upon how UnsafeCell is implemented.
+                // I guess maybe if you can create a &T for a given field, but that sounds incorrect in unsafe code and probably depends upon the caller visibility of things?
+                // I almost feel like Freeze is an insufficient trait and that I want FullFreeze and PartialFreeze or something.
+                //
+                // Oh: `UnsafeCellRanges::collect(bx, pointee_layout, retag_opts.no_precise_im)` in retag.rs seems highly relevant!
                 if let Some(Mutability::Not) = place_ty.ty.ref_mutability()
                     && projection_ty.ty.is_freeze(self.tcx, self.typing_env())
                 {
@@ -968,6 +1014,8 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         trace!(?place);
     }
 
+
+    // coffin: seems like the important place that calls `project`
     /// Represent the *value* which would be read from `place`. If we succeed, return it.
     /// If we fail, return a `PlaceRef` that contains the same value.
     #[instrument(level = "trace", skip(self), ret)]
