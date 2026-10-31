@@ -273,7 +273,10 @@ enum Value<'a, 'tcx> {
     //
     // Extractions.
     /// This is the *value* obtained by projecting another value.
-    Projection(VnIndex, ProjectionElem<VnIndex, ()>),
+    Projection {
+        base: VnIndex,
+        projection: &'a [ProjectionElem<VnIndex, ()>],
+    },
     /// Discriminant of the given value.
     Discriminant(VnIndex),
 
@@ -667,12 +670,15 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 ImmTy::from_immediate(ptr_imm, ty).into()
             }
 
-            Projection(base, elem) => {
-                let base = self.eval_to_const(base)?;
-                // `Index` by constants should have been replaced by `ConstantIndex` by
-                // `simplify_place_projection`.
-                let elem = elem.try_map(|_| None, |()| ty.ty)?;
-                self.ecx.project(base, elem).discard_err()?
+            Projection { base, projection } => {
+                let mut value = *self.eval_to_const(base)?;
+                for proj in projection {
+                    // `Index` by constants should have been replaced by `ConstantIndex` by
+                    // `simplify_place_projection`.
+                    let proj = proj.try_map(|_| None, |()| ty.ty)?;
+                    value = self.ecx.project(&value, proj).discard_err()?;
+                }
+                value
             }
             Address { base, projection, .. } => {
                 debug_assert!(!projection.contains(&ProjectionElem::Deref));
@@ -1013,7 +1019,6 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
         trace!(?place);
     }
-
 
     // coffin: seems like the important place that calls `project`
     /// Represent the *value* which would be read from `place`. If we succeed, return it.
