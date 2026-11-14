@@ -1740,10 +1740,14 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                             )
                         })
                 }
+                ty::Closure(_, args) => args
+                    .as_closure()
+                    .upvar_tys()
+                    .iter()
+                    .any(|arg| ty_may_have_ref_inner(tcx, arg, depth)),
                 ty::Ref(..)
                 | ty::RawPtr(_, _)
                 | ty::Bound(..)
-                | ty::Closure(..)
                 | ty::CoroutineClosure(..)
                 | ty::Dynamic(..)
                 | ty::Foreign(_)
