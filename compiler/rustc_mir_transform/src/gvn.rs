@@ -699,6 +699,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 for proj in projection {
                     // `Index` by constants should have been replaced by `ConstantIndex` by
                     // `simplify_place_projection`.
+                    // BUG?
                     let proj = proj.try_map(|_| None, |()| ty.ty)?;
                     value = self.ecx.project(&value, proj).discard_err()?;
                 }
