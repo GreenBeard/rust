@@ -298,7 +298,12 @@ impl<'tcx> CoffinProjection<'tcx> {
     }
 
     fn assert_valid(&self) {
-        assert!(self.projection.is_empty() || matches!(self.projection[0], ProjectionElem::Deref));
+        if let Some(first) = self.projection.first() {
+            assert!(matches!(*first, ProjectionElem::Deref));
+            for proj in self.projection.iter().skip(1) {
+                assert!(!matches!(*proj, ProjectionElem::Deref));
+            }
+        }
     }
 }
 
@@ -844,8 +849,13 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         };
         let mut projection_idx = 0;
         while projection_idx != projection.len() {
-            (projection_idx, place_ty, value) =
+            let idx_and_ty_and_value =
                 self.project_next(place_ty, value, &projection[projection_idx..])?;
+            (projection_idx, place_ty, value) = (
+                idx_and_ty_and_value.0 + projection_idx,
+                idx_and_ty_and_value.1,
+                idx_and_ty_and_value.2,
+            );
         }
         Some(value)
     }
@@ -993,8 +1003,8 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
         input.projection.push(proj);
         input.projected_type = projection_ty;
-        input.assert_valid();
-        if self.ty_may_have_ref(projection_ty.ty) {
+        if proj == ProjectionElem::Deref && self.ty_may_have_ref(projection_ty.ty) {
+            input.assert_valid();
             CoffinStepResult::Descend
         } else {
             let value = self.insert(
@@ -1128,7 +1138,11 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             else {
                 return Err(place_ref);
             };
-            (projection_idx, place_ty, value) = idx_and_ty_and_value;
+            (projection_idx, place_ty, value) = (
+                idx_and_ty_and_value.0 + projection_idx,
+                idx_and_ty_and_value.1,
+                idx_and_ty_and_value.2,
+            );
             debug_assert!(projection_idx <= projection.len());
         }
 
