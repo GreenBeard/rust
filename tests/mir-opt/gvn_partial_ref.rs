@@ -20,7 +20,6 @@ fn cmp_non_ref(partial_ref: &PartialRef, f: fn()) -> bool {
 fn cmp_ref(partial_ref: &PartialRef, f: fn()) -> bool {
     // CHECK-LABEL: fn cmp_ref(
     // CHECK: _0 = Eq(
-    // to check: _0 = const true;
     let old = partial_ref.b;
     f();
     let new = partial_ref.b;
