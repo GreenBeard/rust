@@ -299,7 +299,7 @@ impl<'tcx> CoffinProjection<'tcx> {
 
     fn assert_valid(&self) {
         if let Some(first) = self.projection.first() {
-            assert!(matches!(*first, ProjectionElem::Deref));
+            assert!(self.projection.len() == 1 || matches!(*first, ProjectionElem::Deref));
             for proj in self.projection.iter().skip(1) {
                 assert!(!matches!(*proj, ProjectionElem::Deref));
             }
@@ -1003,8 +1003,8 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
         input.projection.push(proj);
         input.projected_type = projection_ty;
-        if proj == ProjectionElem::Deref && self.ty_may_have_ref(projection_ty.ty) {
-            input.assert_valid();
+        input.assert_valid();
+        if input.projection[0] == ProjectionElem::Deref && self.ty_may_have_ref(projection_ty.ty) {
             CoffinStepResult::Descend
         } else {
             let value = self.insert(
