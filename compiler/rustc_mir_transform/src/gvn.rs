@@ -293,7 +293,7 @@ struct CoffinProjection<'tcx> {
 }
 
 impl<'tcx> CoffinProjection<'tcx> {
-    fn in_nonfreeze(&self) -> bool {
+    fn _in_nonfreeze(&self) -> bool {
         !self.projection.is_empty()
     }
 
@@ -923,10 +923,10 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                         Value::Union(active, field) if active == f => {
                             return CoffinStepResult::Project((projection_ty, field));
                         }
-                        Value::Projection(
-                            outer_value,
-                            ProjectionElem::Downcast(_, read_variant),
-                        ) if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
+                        Value::Projection {
+                            base: outer_value,
+                            projection: &[ProjectionElem::Downcast(_, read_variant)],
+                        } if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
                         // This pass is not aware of control-flow, so we do not know whether the
                         // replacement we are doing is actually reachable. We could be in any arm of
                         // ```
@@ -991,20 +991,46 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
         };
 
+        input.projection.push(proj);
+        input.projected_type = projection_ty;
+        input.assert_valid();
         if self.ty_may_have_ref(projection_ty.ty) {
-            input.projection.push(proj);
-            input.projected_type = projection_ty;
-            input.assert_valid();
             CoffinStepResult::Descend
         } else {
-            if input.projection.is_empty() {
-                let value = self.insert(projection_ty.ty, Value::Projection(input.base, proj));
-                CoffinStepResult::Project((projection_ty, value))
-            } else {
-                // TODO: switch to actual projection return
-                CoffinStepResult::NoProject
+            let value = self.insert(
+                projection_ty.ty,
+                Value::Projection {
+                    base: input.base,
+                    projection: self.arena.alloc_from_iter(input.projection.iter().copied()),
+                },
+            );
+            CoffinStepResult::Project((projection_ty, value))
+        }
+    }
+
+    #[instrument(level = "trace", skip(self), ret)]
+    fn project_next(
+        &mut self,
+        place_ty: PlaceTy<'tcx>,
+        value: VnIndex,
+        projection: &[ProjectionElem<VnIndex, Ty<'tcx>>],
+    ) -> Option<(usize, PlaceTy<'tcx>, VnIndex)> {
+        let mut state =
+            CoffinProjection { base: value, projection: Vec::new(), projected_type: place_ty };
+        for (i, proj) in projection.iter().enumerate() {
+            match self.project_coffin(&mut state, *proj) {
+                CoffinStepResult::Project((place_ty, value)) => {
+                    return Some((i + 1, place_ty, value));
+                }
+                CoffinStepResult::NoProject => {
+                    return None;
+                }
+                CoffinStepResult::Descend => {
+                    // continue
+                }
             }
         }
+        None
     }
 
     #[instrument(level = "trace", skip(self), ret)]
@@ -1014,104 +1040,10 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         value: VnIndex,
         proj: ProjectionElem<VnIndex, Ty<'tcx>>,
     ) -> Option<(PlaceTy<'tcx>, VnIndex)> {
-        let projection_ty = place_ty.projection_ty(self.tcx, proj);
-        let proj = match proj {
-            ProjectionElem::Deref => {
-                if let Some(Mutability::Not) = place_ty.ty.ref_mutability()
-                    && projection_ty.ty.is_freeze(self.tcx, self.typing_env())
-                {
-                    if let Value::Address { base, projection, .. } = self.get(value)
-                        && let Some(value) = self.dereference_address(base, projection)
-                    {
-                        return Some((projection_ty, value));
-                    }
-                    // We cannot unify two references produced by dereferencing the same nested reference,
-                    // because they may have different lifetimes.
-                    // ```
-                    // let b: &T = *a;
-                    // ... `a` is allowed to be modified. `c` and `b` have different borrowing lifetime.
-                    // Unifying them will extend the lifetime of `b`.
-                    // let c: &T = *a;
-                    // ```
-                    // Furthermore, unifying them can also violate Stacked Borrows or Tree Borrows.
-                    // We can only unify all `*b` and `*c` separately
-                    // because nested shared references are not read-only.
-                    // For more, see <https://github.com/rust-lang/rust/issues/155884> and
-                    // <https://github.com/rust-lang/rust/issues/130853>.
-                    if self.ty_may_have_ref(projection_ty.ty) {
-                        return None;
-                    }
-
-                    // An immutable borrow `_x` always points to the same value for the
-                    // lifetime of the borrow, so we can merge all instances of `*_x`.
-                    let deref = self
-                        .insert(projection_ty.ty, Value::Projection(value, ProjectionElem::Deref));
-                    return Some((projection_ty, deref));
-                } else {
-                    return None;
-                }
-            }
-            ProjectionElem::PhantomDeref => bug!("PhantomDeref in GVN"),
-            ProjectionElem::Downcast(name, index) => ProjectionElem::Downcast(name, index),
-            ProjectionElem::Field(f, _) => match self.get(value) {
-                Value::Aggregate(_, fields) => return Some((projection_ty, fields[f.as_usize()])),
-                Value::Union(active, field) if active == f => return Some((projection_ty, field)),
-                Value::Projection(outer_value, ProjectionElem::Downcast(_, read_variant))
-                    if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
-                    // This pass is not aware of control-flow, so we do not know whether the
-                    // replacement we are doing is actually reachable. We could be in any arm of
-                    // ```
-                    // match Some(x) {
-                    //     Some(y) => /* stuff */,
-                    //     None => /* other */,
-                    // }
-                    // ```
-                    //
-                    // In surface rust, the current statement would be unreachable.
-                    //
-                    // However, from the reference chapter on enums and RFC 2195,
-                    // accessing the wrong variant is not UB if the enum has repr.
-                    // So it's not impossible for a series of MIR opts to generate
-                    // a downcast to an inactive variant.
-                    && written_variant == read_variant =>
-                {
-                    return Some((projection_ty, fields[f.as_usize()]));
-                }
-                _ => ProjectionElem::Field(f, ()),
-            },
-            ProjectionElem::Index(idx) => {
-                if let Value::Repeat(inner, _) = self.get(value) {
-                    return Some((projection_ty, inner));
-                }
-                ProjectionElem::Index(idx)
-            }
-            ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
-                match self.get(value) {
-                    Value::Repeat(inner, _) => {
-                        return Some((projection_ty, inner));
-                    }
-                    Value::Aggregate(_, operands) => {
-                        let offset = if from_end {
-                            operands.len() - offset as usize
-                        } else {
-                            offset as usize
-                        };
-                        let value = operands.get(offset).copied()?;
-                        return Some((projection_ty, value));
-                    }
-                    _ => {}
-                };
-                ProjectionElem::ConstantIndex { offset, min_length, from_end }
-            }
-            ProjectionElem::Subslice { from, to, from_end } => {
-                ProjectionElem::Subslice { from, to, from_end }
-            }
-            ProjectionElem::OpaqueCast(_) => ProjectionElem::OpaqueCast(()),
-            ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
-        };
-
-        let value = self.insert(projection_ty.ty, Value::Projection(value, proj));
-        Some((projection_ty, value))
+        self.project_next(place_ty, value, &[proj]).map(|(next_idx, projection_ty, value)| {
+            debug_assert_eq!(next_idx, 1);
+            (projection_ty, value)
+        })
     }
 
     /// Simplify the projection chain if we know better.
