@@ -32,13 +32,15 @@
           StorageDead(_5);
           StorageDead(_4);
           StorageLive(_6);
-          _6 = copy ((*_1).1: u32);
+-         _6 = copy ((*_1).1: u32);
++         _6 = copy _3;
           StorageLive(_7);
           _7 = copy _3;
           StorageLive(_8);
-          _8 = copy _6;
+-         _8 = copy _6;
 -         _0 = Eq(move _7, move _8);
-+         _0 = Eq(copy _3, copy _6);
++         _8 = copy _3;
++         _0 = const true;
           StorageDead(_8);
           StorageDead(_7);
           StorageDead(_6);
