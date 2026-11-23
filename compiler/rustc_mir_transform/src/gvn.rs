@@ -407,6 +407,13 @@ struct VnState<'body, 'a, 'tcx> {
     arena: &'a DroplessArena,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectStepState<'tcx> {
+    Project { place_ty: PlaceTy<'tcx>, value: VnIndex },
+    NoProject,
+    Descend { place_ty: PlaceTy<'tcx>, value: VnIndex },
+}
+
 impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
     fn new(
         tcx: TyCtxt<'tcx>,
@@ -671,7 +678,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             }
 
             Projection { base, projection } => {
-                let mut value = *self.eval_to_const(base)?;
+                let mut value = self.eval_to_const(base)?.clone();
                 for proj in projection {
                     // `Index` by constants should have been replaced by `ConstantIndex` by
                     // `simplify_place_projection`.
@@ -823,8 +830,10 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 self.project(place_ty, reborrow, ProjectionElem::Deref)?
             }
         };
-        for &proj in projection {
-            (place_ty, value) = self.project(place_ty, value, proj)?;
+        let mut projection_idx = 0;
+        while projection_idx != projection.len() {
+            (projection_idx, place_ty, value) =
+                self.project_next(place_ty, value, &projection[projection_idx..])?;
         }
         Some(value)
     }
@@ -840,48 +849,26 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         // the VnIndex is the value of the local
         proj: ProjectionElem<VnIndex, Ty<'tcx>>,
     ) -> Option<(PlaceTy<'tcx>, VnIndex)> {
+        self.project_next(place_ty, value, &[proj]).map(|(next_idx, projection_ty, value)| {
+            debug_assert_eq!(next_idx, 1);
+            (projection_ty, value)
+        })
+    }
+
+    #[instrument(level = "trace", skip(self), ret)]
+    fn project_next_step(
+        &mut self,
+        in_descend: bool,
+        mut place_ty: PlaceTy<'tcx>,
+        // The problem is that the parent can't be a `VnIndex` for each step. It becomes a `Rvalue` when we have `in_descend` (at least I think).
+        mut value: VnIndex,
+        proj: ProjectionElem<VnIndex, Ty<'tcx>>,
+    ) -> ProjectStepState {
         let projection_ty = place_ty.projection_ty(self.tcx, proj);
         let proj = match proj {
             ProjectionElem::Deref => {
-                // coffin: Hmm, if I'm understanding this correctly the issue is that the GVN is looking at each
-                // component individually. Since I don't think that this code is doing analysis to see that these
-                // can be merged:
-                //
-                // ```
-                // struct Foo<'a> {
-                //     ref: &'a u32,
-                // }
-                //
-                // let foo: &mut Foo = todo!();
-                // let a = foo.ref;
-                // ... (no modification of `foo.ref` or escaping of `foo` via escape analysis and foo is not UnsafePinned so we have exclusive access).
-                // let b = foo.ref;
-                // ```
-                //
-                // but more importantly:
-                // it seems that it also is treating:
-                //
-                // ```
-                // struct Bar {
-                //     x: u32,
-                //     y: UnsafeCell<u32>,
-                // }
-                //
-                // let foo: &Bar = todo!();
-                // let a = &foo.y;
-                // ...
-                // let b = &foo.y;
-                // ```
-                //
-                // as non-mergeable since it is looking at &(*foo).y and sees that *foo is not Freeze...
-                //
-                // I want to say that one can optimize consecutive Field projections if the last is a non-Freeze element but that doesn't seem true based upon how UnsafeCell is implemented.
-                // I guess maybe if you can create a &T for a given field, but that sounds incorrect in unsafe code and probably depends upon the caller visibility of things?
-                // I almost feel like Freeze is an insufficient trait and that I want FullFreeze and PartialFreeze or something.
-                //
-                // Oh: `UnsafeCellRanges::collect(bx, pointee_layout, retag_opts.no_precise_im)` in retag.rs seems highly relevant!
                 if let Some(Mutability::Not) = place_ty.ty.ref_mutability()
-                    && projection_ty.ty.is_freeze(self.tcx, self.typing_env())
+                    && !self.ty_may_have_unsafe_cell(projection_ty.ty)
                 {
                     if let Value::Address { base, projection, .. } = self.get(value)
                         && let Some(value) = self.dereference_address(base, projection)
@@ -907,8 +894,10 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
                     // An immutable borrow `_x` always points to the same value for the
                     // lifetime of the borrow, so we can merge all instances of `*_x`.
-                    let deref = self
-                        .insert(projection_ty.ty, Value::Projection(value, ProjectionElem::Deref));
+                    let deref = self.insert(
+                        projection_ty.ty,
+                        Value::Projection { base: value, projection: &[ProjectionElem::Deref] },
+                    );
                     return Some((projection_ty, deref));
                 } else {
                     return None;
@@ -917,8 +906,12 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             ProjectionElem::PhantomDeref => bug!("PhantomDeref in GVN"),
             ProjectionElem::Downcast(name, index) => ProjectionElem::Downcast(name, index),
             ProjectionElem::Field(f, _) => match self.get(value) {
-                Value::Aggregate(_, fields) => return Some((projection_ty, fields[f.as_usize()])),
-                Value::Union(active, field) if active == f => return Some((projection_ty, field)),
+                Value::Aggregate(_, fields) => {
+                    return Some((projection_ty, fields[f.as_usize()]));
+                }
+                Value::Union(active, field) if active == f => {
+                    return Some((projection_ty, field));
+                }
                 Value::Projection(outer_value, ProjectionElem::Downcast(_, read_variant))
                     if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
                     // This pass is not aware of control-flow, so we do not know whether the
@@ -973,8 +966,177 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
         };
 
-        let value = self.insert(projection_ty.ty, Value::Projection(value, proj));
+        let value =
+            self.insert(projection_ty.ty, Value::Projection { base: value, projection: &[proj] });
         Some((projection_ty, value))
+    }
+
+    // TODO: convert to iterator if possible?
+    #[instrument(level = "trace", skip(self), ret)]
+    fn project_next(
+        &mut self,
+        // coffin: type of the parent in the Place's chain
+        mut place_ty: PlaceTy<'tcx>,
+        // coffin: value of the parent in the Place's chain
+        mut value: VnIndex,
+        // coffin: ordered entries within a projection.
+        // the VnIndex is the value of the local used for as a dynamic index for example `a[b]` where `a: &[T]` & `b: usize`.
+        projection: &[ProjectionElem<VnIndex, Ty<'tcx>>],
+    ) -> Option<(usize, PlaceTy<'tcx>, VnIndex)> {
+        let mut idx = 0;
+        let mut is_descend = false;
+        while idx < projection.len() {
+            let proj = projection[idx];
+            match self.project_next_step(is_descend, place_ty, value, proj) {
+                ProjectStepState::Project => {}
+                ProjectStepState::NoProject => todo!(),
+                ProjectStepState::Descend => todo!(),
+            }
+            // let projection_ty = place_ty.projection_ty(self.tcx, proj);
+            // let proj = match proj {
+            //     ProjectionElem::Deref => {
+            //         // coffin: Hmm, if I'm understanding this correctly the issue is that the GVN is looking at each
+            //         // component individually. Since I don't think that this code is doing analysis to see that these
+            //         // can be merged:
+            //         //
+            //         // ```
+            //         // struct Foo<'a> {
+            //         //     ref: &'a u32,
+            //         // }
+            //         //
+            //         // let foo: &mut Foo = todo!();
+            //         // let a = foo.ref;
+            //         // ... (no modification of `foo.ref` or escaping of `foo` via escape analysis and foo is not UnsafePinned so we have exclusive access).
+            //         // let b = foo.ref;
+            //         // ```
+            //         //
+            //         // but more importantly:
+            //         // it seems that it also is treating:
+            //         //
+            //         // ```
+            //         // struct Bar {
+            //         //     x: u32,
+            //         //     y: UnsafeCell<u32>,
+            //         // }
+            //         //
+            //         // let foo: &Bar = todo!();
+            //         // let a = &foo.y;
+            //         // ...
+            //         // let b = &foo.y;
+            //         // ```
+            //         //
+            //         // as non-mergeable since it is looking at &(*foo).y and sees that *foo is not Freeze...
+            //         //
+            //         // I want to say that one can optimize consecutive Field projections if the last is a non-Freeze element but that doesn't seem true based upon how UnsafeCell is implemented.
+            //         // I guess maybe if you can create a &T for a given field, but that sounds incorrect in unsafe code and probably depends upon the caller visibility of things?
+            //         // I almost feel like Freeze is an insufficient trait and that I want FullFreeze and PartialFreeze or something.
+            //         //
+            //         // Oh: `UnsafeCellRanges::collect(bx, pointee_layout, retag_opts.no_precise_im)` in retag.rs seems highly relevant!
+            //         if let Some(Mutability::Not) = place_ty.ty.ref_mutability()
+            //             && projection_ty.ty.is_freeze(self.tcx, self.typing_env())
+            //         {
+            //             if let Value::Address { base, projection, .. } = self.get(value)
+            //                 && let Some(value) = self.dereference_address(base, projection)
+            //             {
+            //                 return Some((projection_ty, value));
+            //             }
+            //             // We cannot unify two references produced by dereferencing the same nested reference,
+            //             // because they may have different lifetimes.
+            //             // ```
+            //             // let b: &T = *a;
+            //             // ... `a` is allowed to be modified. `c` and `b` have different borrowing lifetime.
+            //             // Unifying them will extend the lifetime of `b`.
+            //             // let c: &T = *a;
+            //             // ```
+            //             // Furthermore, unifying them can also violate Stacked Borrows or Tree Borrows.
+            //             // We can only unify all `*b` and `*c` separately
+            //             // because nested shared references are not read-only.
+            //             // For more, see <https://github.com/rust-lang/rust/issues/155884> and
+            //             // <https://github.com/rust-lang/rust/issues/130853>.
+            //             if self.ty_may_have_ref(projection_ty.ty) {
+            //                 return None;
+            //             }
+
+            //             // An immutable borrow `_x` always points to the same value for the
+            //             // lifetime of the borrow, so we can merge all instances of `*_x`.
+            //             let deref = self.insert(
+            //                 projection_ty.ty,
+            //                 Value::Projection { base: value, projection: &[ProjectionElem::Deref] },
+            //             );
+            //             return Some((projection_ty, deref));
+            //         } else {
+            //             return None;
+            //         }
+            //     }
+            //     ProjectionElem::PhantomDeref => bug!("PhantomDeref in GVN"),
+            //     ProjectionElem::Downcast(name, index) => ProjectionElem::Downcast(name, index),
+            //     ProjectionElem::Field(f, _) => match self.get(value) {
+            //         Value::Aggregate(_, fields) => {
+            //             return Some((projection_ty, fields[f.as_usize()]));
+            //         }
+            //         Value::Union(active, field) if active == f => {
+            //             return Some((projection_ty, field));
+            //         }
+            //         Value::Projection(outer_value, ProjectionElem::Downcast(_, read_variant))
+            //             if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
+            //         // This pass is not aware of control-flow, so we do not know whether the
+            //         // replacement we are doing is actually reachable. We could be in any arm of
+            //         // ```
+            //         // match Some(x) {
+            //         //     Some(y) => /* stuff */,
+            //         //     None => /* other */,
+            //         // }
+            //         // ```
+            //         //
+            //         // In surface rust, the current statement would be unreachable.
+            //         //
+            //         // However, from the reference chapter on enums and RFC 2195,
+            //         // accessing the wrong variant is not UB if the enum has repr.
+            //         // So it's not impossible for a series of MIR opts to generate
+            //         // a downcast to an inactive variant.
+            //         && written_variant == read_variant =>
+            //         {
+            //             return Some((projection_ty, fields[f.as_usize()]));
+            //         }
+            //         _ => ProjectionElem::Field(f, ()),
+            //     },
+            //     ProjectionElem::Index(idx) => {
+            //         if let Value::Repeat(inner, _) = self.get(value) {
+            //             return Some((projection_ty, inner));
+            //         }
+            //         ProjectionElem::Index(idx)
+            //     }
+            //     ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+            //         match self.get(value) {
+            //             Value::Repeat(inner, _) => {
+            //                 return Some((projection_ty, inner));
+            //             }
+            //             Value::Aggregate(_, operands) => {
+            //                 let offset = if from_end {
+            //                     operands.len() - offset as usize
+            //                 } else {
+            //                     offset as usize
+            //                 };
+            //                 let value = operands.get(offset).copied()?;
+            //                 return Some((projection_ty, value));
+            //             }
+            //             _ => {}
+            //         };
+            //         ProjectionElem::ConstantIndex { offset, min_length, from_end }
+            //     }
+            //     ProjectionElem::Subslice { from, to, from_end } => {
+            //         ProjectionElem::Subslice { from, to, from_end }
+            //     }
+            //     ProjectionElem::OpaqueCast(_) => ProjectionElem::OpaqueCast(()),
+            //     ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
+            // };
+
+            // let value = self
+            //     .insert(projection_ty.ty, Value::Projection { base: value, projection: &[proj] });
+            // Some((projection_ty, value))
+        }
+
+        None
     }
 
     /// Simplify the projection chain if we know better.
@@ -1037,21 +1199,35 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         let Some(mut value) = self.locals[place.local] else { return Err(place_ref) };
         // Invariant: `value` has type `place_ty`, with optional downcast variant if needed.
         let mut place_ty = PlaceTy::from_ty(self.local_decls[place.local].ty);
-        for (index, proj) in place.projection.iter().enumerate() {
+
+        let mut projection = Vec::with_capacity(place.projection.len());
+        for proj in place.projection.iter() {
+            let Some(proj) = proj.try_map(|value| self.locals[value], |ty| ty) else {
+                break;
+            };
+            projection.push(proj);
+        }
+
+        let mut projection_idx = 0;
+        while projection_idx != projection.len() {
             if let Some(local) = self.try_as_local(value, location) {
                 // Both `local` and `Place { local: place.local, projection: projection[..index] }`
                 // hold the same value. Therefore, following place holds the value in the original
                 // `place`.
-                place_ref = PlaceRef { local, projection: &place.projection[index..] };
+                place_ref = PlaceRef { local, projection: &place.projection[projection_idx..] };
             }
 
-            let Some(proj) = proj.try_map(|value| self.locals[value], |ty| ty) else {
+            let Some(idx_and_ty_and_value) =
+                self.project_next(place_ty, value, &projection[projection_idx..])
+            else {
                 return Err(place_ref);
             };
-            let Some(ty_and_value) = self.project(place_ty, value, proj) else {
-                return Err(place_ref);
-            };
-            (place_ty, value) = ty_and_value;
+            (projection_idx, place_ty, value) = idx_and_ty_and_value;
+            debug_assert!(projection_idx <= projection.len());
+        }
+
+        if projection_idx < projection.len() {
+            return Err(place_ref);
         }
 
         Ok(value)
@@ -1218,12 +1394,41 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         variant_index: VariantIdx,
         fields: &[VnIndex],
     ) -> Option<VnIndex> {
+        // struct Bar {
+        //     a: u32,
+        //     b: u32,
+        // }
+        //
+        // struct Foo {
+        //     a: UnsafeCell<u32>,
+        //     b: Bar, // aggregate to copy
+        // }
+
+        // then we will have:
+        // Project {
+        //     base: the VnIndex for `&Foo`,
+        //     projection: &[Deref, Field b],
+        // }
+        // Project {
+        //     base: b type Bar,
+        //     projection: &[Field a],
+        // }
+        // Project {
+        //     base: b type Bar,
+        //     projection: &[Field b],
+        // }
+
         let Some(&first_field) = fields.first() else { return None };
-        let Value::Projection(copy_from_value, _) = self.get(first_field) else { return None };
+        let Value::Projection { base: copy_from_value, .. } = self.get(first_field) else {
+            return None;
+        };
 
         // All fields must correspond one-to-one and come from the same aggregate value.
         if fields.iter().enumerate().any(|(index, &v)| {
-            if let Value::Projection(pointer, ProjectionElem::Field(from_index, _)) = self.get(v)
+            if let Value::Projection {
+                base: pointer,
+                projection: &[ProjectionElem::Field(from_index, _)],
+            } = self.get(v)
                 && copy_from_value == pointer
                 && from_index.index() == index
             {
@@ -1235,7 +1440,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         }
 
         let mut copy_from_local_value = copy_from_value;
-        if let Value::Projection(pointer, proj) = self.get(copy_from_value)
+        if let Value::Projection { base: pointer, projection: &[proj] } = self.get(copy_from_value)
             && let ProjectionElem::Downcast(_, read_variant) = proj
         {
             if variant_index == read_variant {
@@ -1812,6 +2017,66 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         ty_may_have_ref_inner(self.tcx, ty, 0)
     }
 
+    fn ty_may_have_unsafe_cell(&self, ty: Ty<'tcx>) -> bool {
+        fn ty_may_have_unsafe_cell_inner<'tcx>(
+            tcx: TyCtxt<'tcx>,
+            ty: Ty<'tcx>,
+            depth: usize,
+        ) -> bool {
+            if !tcx.recursion_limit().value_within_limit(depth) {
+                return true;
+            }
+            let depth = depth + 1;
+            match ty.kind() {
+                ty::Int(_)
+                | ty::Uint(_)
+                | ty::Float(_)
+                | ty::Bool
+                | ty::Char
+                | ty::Str
+                | ty::Never
+                | ty::FnDef(..)
+                | ty::Error(_)
+                | ty::FnPtr(..)
+                | ty::Ref(..)
+                | ty::RawPtr(_, _)
+                | ty::Bound(..) => false,
+                ty::Tuple(fields) => {
+                    fields.iter().any(|field| ty_may_have_unsafe_cell_inner(tcx, field, depth))
+                }
+                ty::Pat(ty, _) | ty::Slice(ty) | ty::Array(ty, _) => {
+                    ty_may_have_unsafe_cell_inner(tcx, *ty, depth)
+                }
+                ty::Adt(adt_def, args) => {
+                    adt.is_unsafe_cell()
+                        || adt_def.all_fields().any(|field| {
+                            ty_may_have_unsafe_cell_inner(
+                                tcx,
+                                field.ty(tcx, args).skip_normalization(),
+                                depth,
+                            )
+                        })
+                }
+                ty::Closure(_, args) => args
+                    .as_closure()
+                    .upvar_tys()
+                    .iter()
+                    .any(|param| ty_may_have_unsafe_cell_inner(tcx, param, depth)),
+                ty::CoroutineClosure(..)
+                | ty::Dynamic(..)
+                | ty::Foreign(_)
+                | ty::Coroutine(..)
+                | ty::CoroutineWitness(..)
+                | ty::UnsafeBinder(_)
+                | ty::Infer(_)
+                | ty::Alias(..)
+                | ty::Param(_)
+                | ty::Placeholder(_) => true,
+            }
+        }
+        ty_may_have_unsafe_cell_inner(self.tcx, ty, 0)
+    }
+
     /// Returns `false` if we're confident that the middle type doesn't have an
     /// interesting niche so we can skip that step when transmuting.
     ///
@@ -2089,39 +2354,56 @@ impl<'tcx> VnState<'_, '_, 'tcx> {
         loc: Location,
         allow_complex_projection: bool,
     ) -> Option<Place<'tcx>> {
+        if let Some(local) = self.try_as_local(index, loc) {
+            return Some(Place { local, projection: ty::List::empty() });
+        }
+
         let mut projection = SmallVec::<[PlaceElem<'tcx>; 1]>::new();
-        loop {
+
+        // `Deref` can only be the first projection in a place.
+        let mut has_deref: bool = false;
+
+        while !has_deref
+            && let Value::Projection { base: pointer, projection: projs } = self.get(index)
+        {
+            // issue is pointer vs index
+            for (i, &proj) in projs.into_iter().enumerate().rev() {
+                if (allow_complex_projection || proj.is_stable_offset())
+                    && let Some(proj) = self.try_as_place_elem(self.ty(index), proj, loc)
+                {
+                    if proj == PlaceElem::Deref {
+                        if i != 0 || has_deref {
+                            return None;
+                        }
+                        has_deref = true;
+
+                        // We can introduce a new dereference if the source value cannot be changed in the body.
+                        // Dereferencing an immutable argument always gives the same value in the body.
+                        match self.get(pointer) {
+                            Value::Argument(_)
+                                if let Some(Mutability::Not) =
+                                    self.ty(pointer).ref_mutability() => {}
+                            _ => {
+                                return None;
+                            }
+                        }
+                    }
+                    projection.push(proj);
+                    index = pointer;
+                } else {
+                    return None;
+                }
+            }
+
             if let Some(local) = self.try_as_local(index, loc) {
                 projection.reverse();
                 let place =
                     Place { local, projection: self.tcx.mk_place_elems(projection.as_slice()) };
                 return Some(place);
-            } else if projection.last() == Some(&PlaceElem::Deref) {
-                // `Deref` can only be the first projection in a place.
-                // If we are here, we failed to find a local, and we already have a `Deref`.
-                // Trying to add projections will only result in an ill-formed place.
-                return None;
-            } else if let Value::Projection(pointer, proj) = self.get(index)
-                && (allow_complex_projection || proj.is_stable_offset())
-                && let Some(proj) = self.try_as_place_elem(self.ty(index), proj, loc)
-            {
-                if proj == PlaceElem::Deref {
-                    // We can introduce a new dereference if the source value cannot be changed in the body.
-                    // Dereferencing an immutable argument always gives the same value in the body.
-                    match self.get(pointer) {
-                        Value::Argument(_)
-                            if let Some(Mutability::Not) = self.ty(pointer).ref_mutability() => {}
-                        _ => {
-                            return None;
-                        }
-                    }
-                }
-                projection.push(proj);
-                index = pointer;
-            } else {
-                return None;
             }
         }
+
+        None
     }
 
     /// If there is a local which is assigned `index`, and its assignment strictly dominates `loc`,
