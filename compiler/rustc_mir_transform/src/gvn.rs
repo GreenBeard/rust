@@ -1146,7 +1146,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             debug_assert!(projection_idx <= projection.len());
         }
 
-        if projection_idx < projection.len() {
+        if projection_idx < place.projection.len() {
             return Err(place_ref);
         }
 
