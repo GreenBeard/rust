@@ -270,7 +270,7 @@ enum Value<'a, 'tcx> {
     /// This is the *value* obtained by projecting another value.
     Projection {
         base: VnIndex,
-        projection: &'a [ProjectionElem<VnIndex, ()>],
+        projection: &'a [ProjectionElem<VnIndex, Ty<'tcx>>],
     },
     /// Discriminant of the given value.
     Discriminant(VnIndex),
@@ -288,7 +288,7 @@ enum Value<'a, 'tcx> {
 #[derive(Debug)]
 struct CoffinProjection<'tcx> {
     base: VnIndex,
-    projection: Vec<ProjectionElem<VnIndex, ()>>,
+    projection: Vec<ProjectionElem<VnIndex, Ty<'tcx>>>,
     projected_type: PlaceTy<'tcx>,
 }
 
@@ -699,8 +699,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 for proj in projection {
                     // `Index` by constants should have been replaced by `ConstantIndex` by
                     // `simplify_place_projection`.
-                    // BUG?
-                    let proj = proj.try_map(|_| None, |()| ty.ty)?;
+                    let proj = proj.try_map(|_| None, |ty| ty)?;
                     value = self.ecx.project(&value, proj).discard_err()?;
                 }
                 value
@@ -871,7 +870,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
         let place_ty = input.projected_type;
         let projection_ty = place_ty.projection_ty(self.tcx, proj);
-        let proj = match proj {
+        match proj {
             ProjectionElem::Deref => {
                 if input.projection.is_empty()
                     && let Some(Mutability::Not) = place_ty.ty.ref_mutability()
@@ -904,8 +903,6 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                         //    );
                         //    return CoffinStepResult::Project((projection_ty, deref));
                         //}
-
-                        ProjectionElem::Deref
                     } else {
                         return CoffinStepResult::NoProject;
                     }
@@ -921,7 +918,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 }
             }
             ProjectionElem::PhantomDeref => bug!("PhantomDeref in GVN"),
-            ProjectionElem::Downcast(name, index) => ProjectionElem::Downcast(name, index),
+            ProjectionElem::Downcast(_, _) => {}
             ProjectionElem::Field(f, _) => {
                 if input.projection.is_empty() {
                     match self.get(input.base) {
@@ -960,21 +957,18 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                                 fields[f.as_usize()],
                             ));
                         }
-                        _ => ProjectionElem::Field(f, ()),
+                        _ => {}
                     }
-                } else {
-                    ProjectionElem::Field(f, ())
                 }
             }
-            ProjectionElem::Index(idx) => {
+            ProjectionElem::Index(_) => {
                 if input.projection.is_empty()
                     && let Value::Repeat(inner, _) = self.get(input.base)
                 {
                     return CoffinStepResult::Project((projection_ty, inner));
                 }
-                ProjectionElem::Index(idx)
             }
-            ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+            ProjectionElem::ConstantIndex { offset, min_length: _, from_end } => {
                 if input.projection.is_empty() {
                     match self.get(input.base) {
                         Value::Repeat(inner, _) => {
@@ -993,14 +987,11 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                         _ => {}
                     };
                 }
-                ProjectionElem::ConstantIndex { offset, min_length, from_end }
             }
-            ProjectionElem::Subslice { from, to, from_end } => {
-                ProjectionElem::Subslice { from, to, from_end }
-            }
-            ProjectionElem::OpaqueCast(_) => ProjectionElem::OpaqueCast(()),
-            ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
-        };
+            ProjectionElem::Subslice { .. } => {}
+            ProjectionElem::OpaqueCast(_) => {}
+            ProjectionElem::UnwrapUnsafeBinder(_) => {}
+        }
 
         input.projection.push(proj);
         input.projected_type = projection_ty;
@@ -1295,8 +1286,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
     fn try_as_place_elem(
         &mut self,
-        ty: Ty<'tcx>,
-        proj: ProjectionElem<VnIndex, ()>,
+        proj: ProjectionElem<VnIndex, Ty<'tcx>>,
         loc: Location,
     ) -> Option<PlaceElem<'tcx>> {
         proj.try_map(
@@ -1305,7 +1295,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 self.reused_locals.insert(local);
                 Some(local)
             },
-            |()| ty,
+            |ty| ty,
         )
     }
 
@@ -2227,10 +2217,9 @@ impl<'tcx> VnState<'_, '_, 'tcx> {
         while !has_deref
             && let Value::Projection { base: pointer, projection: projs } = self.get(index)
         {
-            // issue is pointer vs index
             for (i, &proj) in projs.into_iter().enumerate().rev() {
                 if (allow_complex_projection || proj.is_stable_offset())
-                    && let Some(proj) = self.try_as_place_elem(self.ty(index), proj, loc)
+                    && let Some(proj) = self.try_as_place_elem(proj, loc)
                 {
                     if proj == PlaceElem::Deref {
                         if i != 0 || has_deref {
@@ -2250,11 +2239,11 @@ impl<'tcx> VnState<'_, '_, 'tcx> {
                         }
                     }
                     projection.push(proj);
-                    index = pointer;
                 } else {
                     return None;
                 }
             }
+            index = pointer;
 
             if let Some(local) = self.try_as_local(index, loc) {
                 projection.reverse();
