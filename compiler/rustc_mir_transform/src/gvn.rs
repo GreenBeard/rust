@@ -285,6 +285,30 @@ enum Value<'a, 'tcx> {
     },
 }
 
+#[derive(Debug)]
+struct CoffinProjection<'tcx> {
+    base: VnIndex,
+    projection: Vec<ProjectionElem<VnIndex, ()>>,
+    projected_type: PlaceTy<'tcx>,
+}
+
+impl<'tcx> CoffinProjection<'tcx> {
+    fn in_nonfreeze(&self) -> bool {
+        !self.projection.is_empty()
+    }
+
+    fn assert_valid(&self) {
+        assert!(self.projection.is_empty() || matches!(self.projection[0], ProjectionElem::Deref));
+    }
+}
+
+#[derive(Debug)]
+enum CoffinStepResult<'tcx> {
+    Project((PlaceTy<'tcx>, VnIndex)),
+    NoProject,
+    Descend,
+}
+
 /// Stores and deduplicates pairs of `(Value, Ty)` into in `VnIndex` numbered values.
 ///
 /// This data structure is mostly a partial reimplementation of `FxIndexMap<VnIndex, (Value, Ty)>`.
@@ -824,6 +848,163 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 self.project_next(place_ty, value, &projection[projection_idx..])?;
         }
         Some(value)
+    }
+
+    #[instrument(level = "trace", skip(self), ret)]
+    fn project_coffin(
+        &mut self,
+        input: &mut CoffinProjection<'tcx>,
+        proj: ProjectionElem<VnIndex, Ty<'tcx>>,
+    ) -> CoffinStepResult<'tcx> {
+        input.assert_valid();
+
+        let place_ty = input.projected_type;
+        let projection_ty = place_ty.projection_ty(self.tcx, proj);
+        let proj = match proj {
+            ProjectionElem::Deref => {
+                if input.projection.is_empty()
+                    && let Some(Mutability::Not) = place_ty.ty.ref_mutability()
+                {
+                    if projection_ty.ty.is_freeze(self.tcx, self.typing_env()) {
+                        if let Value::Address { base, projection, .. } = self.get(input.base)
+                            && let Some(value) = self.dereference_address(base, projection)
+                        {
+                            return CoffinStepResult::Project((projection_ty, value));
+                        }
+                        // We cannot unify two references produced by dereferencing the same nested reference,
+                        // because they may have different lifetimes.
+                        // ```
+                        // let b: &T = *a;
+                        // ... `a` is allowed to be modified. `c` and `b` have different borrowing lifetime.
+                        // Unifying them will extend the lifetime of `b`.
+                        // let c: &T = *a;
+                        // ```
+                        // Furthermore, unifying them can also violate Stacked Borrows or Tree Borrows.
+                        // We can only unify all `*b` and `*c` separately
+                        // because nested shared references are not read-only.
+                        // For more, see <https://github.com/rust-lang/rust/issues/155884> and
+                        // <https://github.com/rust-lang/rust/issues/130853>.
+                        //if !self.ty_may_have_ref(projection_ty.ty) {
+                        //    // An immutable borrow `_x` always points to the same value for the
+                        //    // lifetime of the borrow, so we can merge all instances of `*_x`.
+                        //    let deref = self.insert(
+                        //        projection_ty.ty,
+                        //        Value::Projection(input.base, ProjectionElem::Deref),
+                        //    );
+                        //    return CoffinStepResult::Project((projection_ty, deref));
+                        //}
+
+                        ProjectionElem::Deref
+                    } else {
+                        return CoffinStepResult::NoProject;
+                    }
+                    /*
+                    else if projection_ty.ty.is_unsafe_cell() {
+                        return CoffinStepResult::NoProject;
+                    } else {
+                        ProjectionElem::Deref
+                    }
+                    */
+                } else {
+                    return CoffinStepResult::NoProject;
+                }
+            }
+            ProjectionElem::PhantomDeref => bug!("PhantomDeref in GVN"),
+            ProjectionElem::Downcast(name, index) => ProjectionElem::Downcast(name, index),
+            ProjectionElem::Field(f, _) => {
+                if input.projection.is_empty() {
+                    match self.get(input.base) {
+                        Value::Aggregate(_, fields) => {
+                            return CoffinStepResult::Project((
+                                projection_ty,
+                                fields[f.as_usize()],
+                            ));
+                        }
+                        Value::Union(active, field) if active == f => {
+                            return CoffinStepResult::Project((projection_ty, field));
+                        }
+                        Value::Projection(
+                            outer_value,
+                            ProjectionElem::Downcast(_, read_variant),
+                        ) if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
+                        // This pass is not aware of control-flow, so we do not know whether the
+                        // replacement we are doing is actually reachable. We could be in any arm of
+                        // ```
+                        // match Some(x) {
+                        //     Some(y) => /* stuff */,
+                        //     None => /* other */,
+                        // }
+                        // ```
+                        //
+                        // In surface rust, the current statement would be unreachable.
+                        //
+                        // However, from the reference chapter on enums and RFC 2195,
+                        // accessing the wrong variant is not UB if the enum has repr.
+                        // So it's not impossible for a series of MIR opts to generate
+                        // a downcast to an inactive variant.
+                        && written_variant == read_variant =>
+                        {
+                            return CoffinStepResult::Project((
+                                projection_ty,
+                                fields[f.as_usize()],
+                            ));
+                        }
+                        _ => ProjectionElem::Field(f, ()),
+                    }
+                } else {
+                    ProjectionElem::Field(f, ())
+                }
+            }
+            ProjectionElem::Index(idx) => {
+                if input.projection.is_empty()
+                    && let Value::Repeat(inner, _) = self.get(input.base)
+                {
+                    return CoffinStepResult::Project((projection_ty, inner));
+                }
+                ProjectionElem::Index(idx)
+            }
+            ProjectionElem::ConstantIndex { offset, min_length, from_end } => {
+                if input.projection.is_empty() {
+                    match self.get(input.base) {
+                        Value::Repeat(inner, _) => {
+                            return CoffinStepResult::Project((projection_ty, inner));
+                        }
+                        Value::Aggregate(_, operands) => {
+                            let offset = if from_end {
+                                operands.len() - offset as usize
+                            } else {
+                                offset as usize
+                            };
+                            if let Some(value) = operands.get(offset).copied() {
+                                return CoffinStepResult::Project((projection_ty, value));
+                            }
+                        }
+                        _ => {}
+                    };
+                }
+                ProjectionElem::ConstantIndex { offset, min_length, from_end }
+            }
+            ProjectionElem::Subslice { from, to, from_end } => {
+                ProjectionElem::Subslice { from, to, from_end }
+            }
+            ProjectionElem::OpaqueCast(_) => ProjectionElem::OpaqueCast(()),
+            ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
+        };
+
+        if self.ty_may_have_ref(projection_ty.ty) {
+            input.projection.push(proj);
+            input.projected_type = projection_ty;
+            input.assert_valid();
+            CoffinStepResult::Descend
+        } else {
+            if input.projection.is_empty() {
+                let value = self.insert(projection_ty.ty, Value::Projection(input.base, proj));
+                CoffinStepResult::Project((projection_ty, value))
+            } else {
+                // TODO: switch to actual projection return
+                CoffinStepResult::NoProject
+            }
+        }
     }
 
     #[instrument(level = "trace", skip(self), ret)]
