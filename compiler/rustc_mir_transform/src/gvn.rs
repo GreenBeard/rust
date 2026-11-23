@@ -268,7 +268,10 @@ enum Value<'a, 'tcx> {
 
     // Extractions.
     /// This is the *value* obtained by projecting another value.
-    Projection(VnIndex, ProjectionElem<VnIndex, ()>),
+    Projection {
+        base: VnIndex,
+        projection: &'a [ProjectionElem<VnIndex, ()>],
+    },
     /// Discriminant of the given value.
     Discriminant(VnIndex),
 
@@ -662,12 +665,15 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 ImmTy::from_immediate(ptr_imm, ty).into()
             }
 
-            Projection(base, elem) => {
-                let base = self.eval_to_const(base)?;
-                // `Index` by constants should have been replaced by `ConstantIndex` by
-                // `simplify_place_projection`.
-                let elem = elem.try_map(|_| None, |()| ty.ty)?;
-                self.ecx.project(base, elem).discard_err()?
+            Projection { base, projection } => {
+                let mut value = self.eval_to_const(base)?.clone();
+                for proj in projection {
+                    // `Index` by constants should have been replaced by `ConstantIndex` by
+                    // `simplify_place_projection`.
+                    let proj = proj.try_map(|_| None, |()| ty.ty)?;
+                    value = self.ecx.project(&value, proj).discard_err()?;
+                }
+                value
             }
             Address { base, projection, .. } => {
                 debug_assert!(!projection.contains(&ProjectionElem::Deref));
@@ -812,8 +818,10 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 self.project(place_ty, reborrow, ProjectionElem::Deref)?
             }
         };
-        for &proj in projection {
-            (place_ty, value) = self.project(place_ty, value, proj)?;
+        let mut projection_idx = 0;
+        while projection_idx != projection.len() {
+            (projection_idx, place_ty, value) =
+                self.project_next(place_ty, value, &projection[projection_idx..])?;
         }
         Some(value)
     }
@@ -984,21 +992,35 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         let Some(mut value) = self.locals[place.local] else { return Err(place_ref) };
         // Invariant: `value` has type `place_ty`, with optional downcast variant if needed.
         let mut place_ty = PlaceTy::from_ty(self.local_decls[place.local].ty);
-        for (index, proj) in place.projection.iter().enumerate() {
+
+        let mut projection = Vec::with_capacity(place.projection.len());
+        for proj in place.projection.iter() {
+            let Some(proj) = proj.try_map(|value| self.locals[value], |ty| ty) else {
+                break;
+            };
+            projection.push(proj);
+        }
+
+        let mut projection_idx = 0;
+        while projection_idx != projection.len() {
             if let Some(local) = self.try_as_local(value, location) {
                 // Both `local` and `Place { local: place.local, projection: projection[..index] }`
                 // hold the same value. Therefore, following place holds the value in the original
                 // `place`.
-                place_ref = PlaceRef { local, projection: &place.projection[index..] };
+                place_ref = PlaceRef { local, projection: &place.projection[projection_idx..] };
             }
 
-            let Some(proj) = proj.try_map(|value| self.locals[value], |ty| ty) else {
+            let Some(idx_and_ty_and_value) =
+                self.project_next(place_ty, value, &projection[projection_idx..])
+            else {
                 return Err(place_ref);
             };
-            let Some(ty_and_value) = self.project(place_ty, value, proj) else {
-                return Err(place_ref);
-            };
-            (place_ty, value) = ty_and_value;
+            (projection_idx, place_ty, value) = idx_and_ty_and_value;
+            debug_assert!(projection_idx <= projection.len());
+        }
+
+        if projection_idx < projection.len() {
+            return Err(place_ref);
         }
 
         Ok(value)
@@ -1165,12 +1187,41 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         variant_index: VariantIdx,
         fields: &[VnIndex],
     ) -> Option<VnIndex> {
+        // struct Bar {
+        //     a: u32,
+        //     b: u32,
+        // }
+        //
+        // struct Foo {
+        //     a: UnsafeCell<u32>,
+        //     b: Bar, // aggregate to copy
+        // }
+
+        // then we will have:
+        // Project {
+        //     base: the VnIndex for `&Foo`,
+        //     projection: &[Deref, Field b],
+        // }
+        // Project {
+        //     base: b type Bar,
+        //     projection: &[Field a],
+        // }
+        // Project {
+        //     base: b type Bar,
+        //     projection: &[Field b],
+        // }
+
         let Some(&first_field) = fields.first() else { return None };
-        let Value::Projection(copy_from_value, _) = self.get(first_field) else { return None };
+        let Value::Projection { base: copy_from_value, .. } = self.get(first_field) else {
+            return None;
+        };
 
         // All fields must correspond one-to-one and come from the same aggregate value.
         if fields.iter().enumerate().any(|(index, &v)| {
-            if let Value::Projection(pointer, ProjectionElem::Field(from_index, _)) = self.get(v)
+            if let Value::Projection {
+                base: pointer,
+                projection: &[ProjectionElem::Field(from_index, _)],
+            } = self.get(v)
                 && copy_from_value == pointer
                 && from_index.index() == index
             {
@@ -1182,7 +1233,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         }
 
         let mut copy_from_local_value = copy_from_value;
-        if let Value::Projection(pointer, proj) = self.get(copy_from_value)
+        if let Value::Projection { base: pointer, projection: &[proj] } = self.get(copy_from_value)
             && let ProjectionElem::Downcast(_, read_variant) = proj
         {
             if variant_index == read_variant {
@@ -2036,39 +2087,56 @@ impl<'tcx> VnState<'_, '_, 'tcx> {
         loc: Location,
         allow_complex_projection: bool,
     ) -> Option<Place<'tcx>> {
+        if let Some(local) = self.try_as_local(index, loc) {
+            return Some(Place { local, projection: ty::List::empty() });
+        }
+
         let mut projection = SmallVec::<[PlaceElem<'tcx>; 1]>::new();
-        loop {
+
+        // `Deref` can only be the first projection in a place.
+        let mut has_deref: bool = false;
+
+        while !has_deref
+            && let Value::Projection { base: pointer, projection: projs } = self.get(index)
+        {
+            // issue is pointer vs index
+            for (i, &proj) in projs.into_iter().enumerate().rev() {
+                if (allow_complex_projection || proj.is_stable_offset())
+                    && let Some(proj) = self.try_as_place_elem(self.ty(index), proj, loc)
+                {
+                    if proj == PlaceElem::Deref {
+                        if i != 0 || has_deref {
+                            return None;
+                        }
+                        has_deref = true;
+
+                        // We can introduce a new dereference if the source value cannot be changed in the body.
+                        // Dereferencing an immutable argument always gives the same value in the body.
+                        match self.get(pointer) {
+                            Value::Argument(_)
+                                if let Some(Mutability::Not) =
+                                    self.ty(pointer).ref_mutability() => {}
+                            _ => {
+                                return None;
+                            }
+                        }
+                    }
+                    projection.push(proj);
+                    index = pointer;
+                } else {
+                    return None;
+                }
+            }
+
             if let Some(local) = self.try_as_local(index, loc) {
                 projection.reverse();
                 let place =
                     Place { local, projection: self.tcx.mk_place_elems(projection.as_slice()) };
                 return Some(place);
-            } else if projection.last() == Some(&PlaceElem::Deref) {
-                // `Deref` can only be the first projection in a place.
-                // If we are here, we failed to find a local, and we already have a `Deref`.
-                // Trying to add projections will only result in an ill-formed place.
-                return None;
-            } else if let Value::Projection(pointer, proj) = self.get(index)
-                && (allow_complex_projection || proj.is_stable_offset())
-                && let Some(proj) = self.try_as_place_elem(self.ty(index), proj, loc)
-            {
-                if proj == PlaceElem::Deref {
-                    // We can introduce a new dereference if the source value cannot be changed in the body.
-                    // Dereferencing an immutable argument always gives the same value in the body.
-                    match self.get(pointer) {
-                        Value::Argument(_)
-                            if let Some(Mutability::Not) = self.ty(pointer).ref_mutability() => {}
-                        _ => {
-                            return None;
-                        }
-                    }
-                }
-                projection.push(proj);
-                index = pointer;
-            } else {
-                return None;
             }
         }
+
+        None
     }
 
     /// If there is a local which is assigned `index`, and its assignment strictly dominates `loc`,
